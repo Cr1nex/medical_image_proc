@@ -1,0 +1,47 @@
+# Model configuration
+model: segresnet
+in_channels: 4       # T1, T1ce, T2, FLAIR
+out_channels: 4      # background, necrotic core, edema, enhancing tumor
+
+# Loss function
+loss: dice_focal
+focal_gamma: 2.0
+dice_focal_lambda_dice: 0.5
+dice_focal_lambda_focal: 0.5
+
+# Training
+lr: 1.0e-4
+weight_decay: 1.0e-5
+batch_size: 1
+max_epochs: 300
+val_interval: 5
+num_workers: 4
+seed: 42
+
+# Patch-based training
+patch_size: [128, 128, 128]
+pos_neg_ratio: 1
+num_samples: 4        # increased from 2
+
+# Inference
+sw_batch_size: 4
+sw_overlap: 0.75      # increased from 0.5 for better boundary accuracy
+
+# Data
+data_dir: data/raw/BraTS2021_Training_Data
+cache_dir: data/cache/segresnet
+output_dir: outputs
+train_split: 0.8
+val_split: 0.1
+
+# Augmentation
+augmentation:
+  flip_prob: 0.5
+  rotate90_prob: 0.5
+  gaussian_noise_prob: 0.2
+  gaussian_noise_std: 0.05
+
+# Logging
+use_wandb: false
+wandb_project: brats-segmentation
+log_interval: 10

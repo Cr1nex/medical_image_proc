@@ -1,0 +1,32 @@
+
+# Data — too large for GitHub (upload to Google Drive for Colab)
+data/
+
+# Model checkpoints and training outputs
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Env
+.env
+*.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
