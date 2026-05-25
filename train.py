@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from src.data.preprocessing import build_data_list_auto, split_data
-from src.data.dataset import build_dataloaders
+from src.data.dataset import build_dataloaders, warm_cache
 from src.models.unet3d import build_model, count_parameters
 from src.models.losses import build_loss
 from src.training.trainer import Trainer
@@ -87,10 +87,12 @@ def main() -> None:
     )
     print(f"Split: {len(train_files)} train / {len(val_files)} val / {len(test_files)} test")
 
-    print("Building dataloaders (caching may take a few minutes)...")
+    print("Building dataloaders...")
     train_loader, val_loader, test_loader = build_dataloaders(
         train_files, val_files, test_files, cfg
     )
+    if not args.dry_run:
+        warm_cache(train_loader.dataset, num_workers=cfg.get("num_workers", 8))
 
     # ------------------------------------------------------------------
     # Model & Loss

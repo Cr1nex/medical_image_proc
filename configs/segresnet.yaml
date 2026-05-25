@@ -15,7 +15,10 @@ weight_decay: 1.0e-5
 batch_size: 1
 max_epochs: 150
 val_interval: 10
-num_workers: 4
+num_workers: 8      # 8 is safe; 16 OOMs during NIfTI cache build on 32GB
+persistent_workers: false
+pin_memory: true
+prefetch_factor: 4
 seed: 42
 
 # Patch-based training
@@ -28,6 +31,9 @@ sw_batch_size: 2
 sw_overlap: 0.75      # increased from 0.5 for better boundary accuracy
 
 # Data
+# combined_manifest.csv = BraTS 2021 (1251) + UPenn-GBM (170) = 1421 cases
+# MSD Task01: public download (4.87 GB) contains images only; labels not included.
+# To add MSD, obtain the labeled release (~7 GB), then run prepare_msd.py → merge_manifests.py
 dataset_format: csv
 manifest: data/combined_manifest.csv
 modality_keys: [t1, t1ce, t2, flair]

@@ -1,6 +1,8 @@
 
 # Data — too large for GitHub (upload to Google Drive for Colab)
 data/
+!src/data/
+!src/data/**
 
 # Model checkpoints and training outputs
 outputs/
@@ -30,3 +32,5 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+.claude
+CLAUDE.md

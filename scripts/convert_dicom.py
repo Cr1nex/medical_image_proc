@@ -164,10 +164,71 @@ def check_dcm2niix(path: str) -> None:
     if not shutil.which(path):
         print(
             f"ERROR: dcm2niix not found ('{path}').\n"
-            "Install:  conda install -n imgp -c conda-forge dcm2niix",
+            "Install:  conda install -n medimgp -c conda-forge dcm2niix",
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Windows long-path junction helper
+#
+# dcm2niix uses Win32 APIs with MAX_PATH (260). When the source DICOM path
+# exceeds this limit (common with IDC UUID-deep layouts), dcm2niix reports
+# "Unable to find any DICOM images". We work around this by creating a
+# temporary NTFS junction at a short path (C:\dcmtmp) that points to the
+# real root, making all sub-paths visible to dcm2niix.
+# ---------------------------------------------------------------------------
+
+_JUNCTION_PATH: Path | None = None  # module-level so cleanup can find it
+
+
+def _setup_windows_junction(dicom_root: Path) -> Path:
+    """
+    Create a short-path junction for dicom_root on Windows.
+    Returns the junction path (or dicom_root unchanged if not needed).
+    """
+    global _JUNCTION_PATH
+    if sys.platform != "win32":
+        return dicom_root
+
+    # Resolve to absolute path so the length check works correctly.
+    dicom_abs = dicom_root.resolve()
+
+    # Only create the junction if DICOM file paths would exceed MAX_PATH.
+    sample_files = list(dicom_abs.rglob("*.dcm"))[:1]
+    if not sample_files or len(str(sample_files[0])) <= 260:
+        return dicom_abs  # Return absolute path regardless
+
+    junc = Path("C:/dcmtmp")
+    _remove_windows_junction(junc)
+    result = subprocess.run(
+        ["cmd", "/c", f"mklink /J {junc} {dicom_abs}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not junc.exists():
+        print(f"WARNING: could not create junction at {junc}: {result.stderr.strip()}")
+        return dicom_abs
+
+    _JUNCTION_PATH = junc
+    print(f"Created junction {junc} → {dicom_abs} (path-length workaround)")
+    return junc
+
+
+def _remove_windows_junction(junc: Path) -> None:
+    if sys.platform == "win32" and (junc.exists() or junc.is_symlink()):
+        subprocess.run(["cmd", "/c", f"rmdir /s /q {junc}"], capture_output=True)
+
+
+def _remap_via_junction(original: Path, original_root: Path, junction: Path) -> Path:
+    """Replace original_root prefix with the junction path."""
+    if original_root == junction:
+        return original
+    try:
+        rel = original.relative_to(original_root)
+        return junction / rel
+    except ValueError:
+        return original
 
 
 def convert_mr_series(series_dir: Path, out_dir: Path, dcm2niix: str) -> list[Path]:
@@ -260,79 +321,93 @@ def main() -> None:
             label, keyword = item.split("=", 1)
             modality_map.setdefault(label, []).insert(0, keyword)
 
-    dicom_root = Path(args.dicom_dir)
-    out_dir    = Path(args.out_dir)
-    expected   = args.modalities
+    dicom_root_real = Path(args.dicom_dir).resolve()
+    out_dir         = Path(args.out_dir)
+    expected        = args.modalities
 
-    if not dicom_root.exists():
-        print(f"ERROR: {dicom_root} not found", file=sys.stderr)
+    if not dicom_root_real.exists():
+        print(f"ERROR: {dicom_root_real} not found", file=sys.stderr)
         sys.exit(1)
 
     if not args.dry_run:
         check_dcm2niix(args.dcm2niix_path)
 
-    print(f"Scanning: {dicom_root}")
-    patients = _collect_patients(dicom_root)
-    total_series = sum(len(v) for v in patients.values())
-    print(f"Found {len(patients)} patients, {total_series} series\n")
+    # On Windows, create a short-path junction if DICOM paths exceed MAX_PATH.
+    # dicom_root is either the junction path or the resolved absolute real path.
+    dicom_root = _setup_windows_junction(dicom_root_real) if not args.dry_run else dicom_root_real
 
-    manifest_rows: list[dict] = []
-    skipped = 0
+    try:
+        print(f"Scanning: {dicom_root_real}")
+        patients = _collect_patients(dicom_root)
+        total_series = sum(len(v) for v in patients.values())
+        print(f"Found {len(patients)} patients, {total_series} series\n")
 
-    for patient_id, series_dirs in sorted(patients.items()):
-        patient_out = out_dir / patient_id
-        found: dict[str, str] = {}
-        seg_dirs: list[Path] = []
+        manifest_rows: list[dict] = []
+        skipped = 0
 
-        for series_dir in series_dirs:
-            desc, dicom_mod = _read_series_description(series_dir)
+        for patient_id, series_dirs in sorted(patients.items()):
+            patient_out = out_dir / patient_id
+            found: dict[str, str] = {}
+            seg_dirs: list[Path] = []
 
-            if dicom_mod == "SEG":
-                seg_dirs.append(series_dir)
-                continue
+            for series_dir in series_dirs:
+                # For desc/modality detection we can still use the real path
+                real_series = _remap_via_junction(series_dir, dicom_root, dicom_root_real)
+                desc, dicom_mod = _read_series_description(real_series)
 
-            modality = _guess_modality(desc, modality_map)
+                if dicom_mod == "SEG":
+                    seg_dirs.append(series_dir)  # keep junction path for dcm2niix
+                    continue
+
+                modality = _guess_modality(desc, modality_map)
+                if args.dry_run:
+                    label = modality or "?"
+                    print(f"  {patient_id:25s}  {label:6s}  {desc}")
+                    continue
+
+                if modality is None:
+                    continue
+
+                if modality in found:
+                    continue  # keep first occurrence
+
+                nifti_out = patient_out / modality
+                niftis = convert_mr_series(series_dir, nifti_out, args.dcm2niix_path)
+                if niftis:
+                    found[modality] = str(niftis[0])
+
             if args.dry_run:
-                label = modality or "?"
-                print(f"  {patient_id:25s}  {label:6s}  {desc}")
                 continue
 
-            if modality is None:
+            # Convert first available SEG series (highdicom uses Python I/O → handles long paths)
+            if seg_dirs:
+                real_seg = _remap_via_junction(seg_dirs[0], dicom_root, dicom_root_real)
+                seg_out  = patient_out / "label"
+                seg_path = convert_seg_series(real_seg, seg_out)
+                if seg_path:
+                    found["label"] = str(seg_path)
+
+            missing = [m for m in expected if m not in found]
+            if missing and args.require_all:
+                print(f"  SKIPPED {patient_id} (missing: {missing})")
+                skipped += 1
                 continue
 
-            if modality in found:
-                continue  # keep first occurrence
+            if missing:
+                print(f"  WARNING {patient_id}: missing {missing}")
+            else:
+                print(f"  OK      {patient_id}")
 
-            nifti_out = patient_out / modality
-            niftis = convert_mr_series(series_dir, nifti_out, args.dcm2niix_path)
-            if niftis:
-                found[modality] = str(niftis[0])
+            row = {m: found.get(m, "") for m in expected}
+            if "label" in found:
+                row["label"] = found["label"]
+            manifest_rows.append(row)
 
-        if args.dry_run:
-            continue
-
-        # Convert first available SEG series
-        if seg_dirs:
-            seg_out = patient_out / "label"
-            seg_path = convert_seg_series(seg_dirs[0], seg_out)
-            if seg_path:
-                found["label"] = str(seg_path)
-
-        missing = [m for m in expected if m not in found]
-        if missing and args.require_all:
-            print(f"  SKIPPED {patient_id} (missing: {missing})")
-            skipped += 1
-            continue
-
-        if missing:
-            print(f"  WARNING {patient_id}: missing {missing}")
-        else:
-            print(f"  OK      {patient_id}")
-
-        row = {m: found.get(m, "") for m in expected}
-        if "label" in found:
-            row["label"] = found["label"]
-        manifest_rows.append(row)
+    finally:
+        # Always clean up the Windows junction, even on error
+        if _JUNCTION_PATH is not None:
+            _remove_windows_junction(_JUNCTION_PATH)
+            print(f"Removed junction {_JUNCTION_PATH}")
 
     if args.dry_run:
         print("\n[dry-run] No files converted.")
@@ -352,12 +427,10 @@ def main() -> None:
 
     print(f"\nConverted: {len(manifest_rows)}  |  Skipped: {skipped}")
     print(f"Manifest  → {manifest_path}")
-    print("\nNext: preprocess converted volumes:")
-    print(f"  conda run -n imgp python preprocess.py \\")
-    print(f"      --manifest {manifest_path} \\")
-    print(f"      --modality-keys {' '.join(expected)} \\")
-    print(f"      --out-dir {out_dir}_preprocessed \\")
-    print(f"      --resample --bias-correct")
+    print("\nNext: build UPenn manifest:")
+    print(f"  conda run -n medimgp python scripts/build_upenn_manifest.py \\")
+    print(f"      --converted-dir {out_dir} \\")
+    print(f"      --out data/preprocessed/upenn_gbm/manifest.csv")
 
 
 if __name__ == "__main__":

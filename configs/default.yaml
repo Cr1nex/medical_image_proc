@@ -15,7 +15,10 @@ weight_decay: 1.0e-5
 batch_size: 2
 max_epochs: 300
 val_interval: 5
-num_workers: 8      # 16 OOM'd WSL2; 8 is safe on 32-core/32GB — avoids fork overhead spike
+num_workers: 8      # 8 is safe on 32GB DDR5; 16 OOMs during initial NIfTI cache build (each worker decompresses full 240³ volumes simultaneously)
+persistent_workers: false  # disabled — causes Windows DataLoader deadlocks with MONAI transforms
+pin_memory: true           # DMA transfer to 5080 VRAM without extra CPU copy
+prefetch_factor: 4         # buffer 4 batches per worker ahead of GPU to smooth utilization
 grad_accum_steps: 4 # accumulate gradients over N micro-batches before optimizer step
 seed: 42
 
