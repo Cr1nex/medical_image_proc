@@ -13,11 +13,12 @@ import argparse
 import copy
 import random
 import yaml
+from datetime import datetime
 
 import numpy as np
 import torch
 
-from src.data.preprocessing import build_data_list, split_data
+from src.data.preprocessing import build_data_list_auto, split_data
 from src.data.dataset import build_dataloaders
 from src.models.unet3d import build_model, count_parameters
 from src.models.losses import build_loss
@@ -62,7 +63,7 @@ def main():
 
     # Build data once — shared across all runs
     print("\nScanning dataset...")
-    data_list = build_data_list(base_cfg["data_dir"])
+    data_list = build_data_list_auto(base_cfg)
     print(f"Found {len(data_list)} cases")
 
     train_files, val_files, test_files = split_data(
@@ -76,13 +77,14 @@ def main():
         train_files, val_files, test_files, base_cfg
     )
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results = {}
 
     for exp in EXPERIMENTS:
         cfg = copy.deepcopy(base_cfg)
         cfg.update(exp)
 
-        run_name = f"{cfg['model']}_{cfg['loss']}_lr{cfg['lr']:.0e}"
+        run_name = f"{cfg['model']}_{cfg['loss']}_lr{cfg['lr']:.0e}_{timestamp}"
         print(f"\n{'#'*60}")
         print(f"  Starting: {run_name}")
         print(f"{'#'*60}")

@@ -13,22 +13,29 @@ dice_focal_lambda_focal: 0.5
 lr: 1.0e-4
 weight_decay: 1.0e-5
 batch_size: 1
-max_epochs: 300
-val_interval: 5
+max_epochs: 150
+val_interval: 10
 num_workers: 4
 seed: 42
 
 # Patch-based training
 patch_size: [128, 128, 128]
 pos_neg_ratio: 1
-num_samples: 4        # increased from 2
+num_samples: 2        # 2 patches/case → effective batch=2 → fits in 16GB VRAM
 
 # Inference
-sw_batch_size: 4
+sw_batch_size: 2
 sw_overlap: 0.75      # increased from 0.5 for better boundary accuracy
 
 # Data
-data_dir: data/raw/BraTS2021_Training_Data
+dataset_format: csv
+manifest: data/combined_manifest.csv
+modality_keys: [t1, t1ce, t2, flair]
+data_dir: data/raw/BraTS2021_Training_Data   # fallback if manifest not found
+# cache_mode: persistent  = cache transforms to disk (default, zero RAM pressure)
+# cache_mode: ram         = load everything into RAM (fast but needs 30-50 GB)
+# cache_mode: none        = no caching (slowest)
+cache_mode: "none"    # no disk cache; 32GB RAM keeps NIfTIs warm via OS page cache
 cache_dir: data/cache/segresnet
 output_dir: outputs
 train_split: 0.8
@@ -40,6 +47,10 @@ augmentation:
   rotate90_prob: 0.5
   gaussian_noise_prob: 0.2
   gaussian_noise_std: 0.05
+  intensity_scale_prob: 0.5
+  intensity_scale_factor: 0.1
+  intensity_shift_prob: 0.5
+  intensity_shift_offset: 0.1
 
 # Logging
 use_wandb: false

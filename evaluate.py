@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from src.data.preprocessing import build_data_list, split_data
+from src.data.preprocessing import build_data_list_auto, split_data
 from src.data.dataset import build_dataloaders
 from src.models.unet3d import build_model
 from src.evaluation.metrics import evaluate, print_results
@@ -77,7 +77,7 @@ def main() -> None:
     print(f"Loaded checkpoint: {args.checkpoint}")
 
     # Data
-    data_list = build_data_list(cfg["data_dir"])
+    data_list = build_data_list_auto(cfg)
     train_files, val_files, test_files = split_data(
         data_list,
         train_frac=cfg.get("train_split", 0.8),
@@ -111,7 +111,7 @@ def _generate_visualizations(model, data_loader, cfg, device, n_cases: int) -> N
     from monai.inferers import SlidingWindowInferer
     from monai.transforms import AsDiscrete, Compose
     from monai.data import decollate_batch
-    from torch.cuda.amp import autocast
+    from torch.amp import autocast
     import nibabel as nib
     import numpy as np
 
@@ -138,7 +138,7 @@ def _generate_visualizations(model, data_loader, cfg, device, n_cases: int) -> N
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
 
-            with autocast():
+            with autocast("cuda"):
                 preds = inferer(images, model)
 
             pred_mask = post_pred(decollate_batch(preds)[0]).squeeze(0).cpu().numpy()

@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
 import plotly.graph_objects as go
+import scipy.ndimage as ndi
 import torch
 import yaml
 
@@ -48,15 +49,20 @@ OUTPUTS_DIR  = Path("outputs")
 DATA_DIR     = Path("data/raw/BraTS2021_Training_Data")
 CONFIG_PATH  = Path("configs/default.yaml")
 MODALITIES   = ["t1", "t1ce", "t2", "flair"]
-FLAIR_CH     = 3       # index in the stacked [4, H, W, D] tensor
 NUM_CLASSES  = 4
 DEFAULT_PATCH = [96, 96, 96]
 
 CLASS_COLORS = {
-    1: (1.0, 0.15, 0.15, 0.65),   # NCR/NET  — red
-    2: (0.15, 0.85, 0.15, 0.55),  # Edema    — green
-    3: (0.15, 0.15, 1.00, 0.70),  # Enhancing — blue
+    1: (1.00, 0.00, 0.00, 0.90),  # NCR/NET  — bright, high-visibility red
+    2: (0.15, 0.75, 0.15, 0.40),  # Edema    — reduced alpha to avoid masking red
+    3: (0.15, 0.35, 1.00, 0.50),  # Enhancing — reduced alpha to avoid masking red
 }
+PLOTLY_COLORS = {
+    1: ("255,0,0", 0.90),
+    2: ("60,190,60", 0.35),
+    3: ("60,100,255", 0.45),
+}
+PLOTLY_RENDER_ORDER = [2, 3, 1]  # draw NCR last so it remains visible on overlap
 CLASS_LABELS = {
     1: "NCR/NET (Necrotic Core)",
     2: "Edema",
@@ -104,20 +110,90 @@ def load_checkpoint(ckpt_path: str) -> tuple[torch.nn.Module, dict, torch.device
 # Preprocessing (mirrors dataset.py deterministic base transforms)
 # ---------------------------------------------------------------------------
 
-def build_inference_transforms() -> Compose:
-    return Compose([
-        LoadImaged(keys=MODALITIES, image_only=False),
-        EnsureChannelFirstd(keys=MODALITIES),
-        ConcatItemsd(keys=MODALITIES, name="image", dim=0),
-        DeleteItemsd(keys=MODALITIES),
+def _resolve_modality_order(cfg: dict) -> list[str]:
+    """
+    Resolve modality order for inference.
+    If checkpoint modality_keys is missing or incompatible with this 4-input UI,
+    fall back to default BraTS ordering.
+    """
+    raw = cfg.get("modality_keys", MODALITIES)
+    if not isinstance(raw, list):
+        return list(MODALITIES)
+
+    ordered: list[str] = []
+    for key in raw:
+        k = str(key).lower()
+        if k in MODALITIES and k not in ordered:
+            ordered.append(k)
+
+    if len(ordered) != len(MODALITIES):
+        return list(MODALITIES)
+    return ordered
+
+
+def build_inference_transforms(modality_order: list[str], cfg: dict | None = None) -> Compose:
+    # Mirror the training base transform pipeline so inference sees the same
+    # preprocessing as training.  Omitting clipping (training does it) shifts
+    # the input distribution and degrades predictions significantly.
+    prep = (cfg or {}).get("preprocessing", {})
+    do_clip   = prep.get("clip_intensities", True)
+    lower_pct = prep.get("clip_lower_pct",  0.5)
+    upper_pct = prep.get("clip_upper_pct", 99.5)
+
+    from src.data.dataset import ClipIntensityByPercentiled
+
+    steps: list = [
+        LoadImaged(keys=modality_order, image_only=False),
+        EnsureChannelFirstd(keys=modality_order),
+        ConcatItemsd(keys=modality_order, name="image", dim=0),
+        DeleteItemsd(keys=modality_order),
+    ]
+    if do_clip:
+        steps.append(ClipIntensityByPercentiled(
+            keys=["image"], lower_pct=lower_pct, upper_pct=upper_pct,
+        ))
+    steps += [
         NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
         EnsureTyped(keys=["image"]),
-    ])
+    ]
+    return Compose(steps)
 
 
 def load_gt(label_path: str) -> np.ndarray:
     vol = nib.load(label_path).get_fdata(dtype=np.float32)
     return remap_labels(vol.astype(np.int32))
+
+
+def _voxel_spacing_from_affine(affine: np.ndarray) -> tuple[float, float, float]:
+    """Extract voxel spacing (mm) from a 4x4 affine matrix."""
+    arr = np.asarray(affine, dtype=np.float64)
+    if arr.shape != (4, 4):
+        return (1.0, 1.0, 1.0)
+
+    spacing = np.linalg.norm(arr[:3, :3], axis=0)
+    if not np.all(np.isfinite(spacing)) or np.any(spacing <= 0):
+        return (1.0, 1.0, 1.0)
+    return (float(spacing[0]), float(spacing[1]), float(spacing[2]))
+
+
+def _keep_main_tumor_component(mask: np.ndarray) -> np.ndarray:
+    """
+    Keep only the dominant connected whole-tumor component for 3D display.
+    This removes isolated false-positive islands that can look detached.
+    """
+    whole_tumor = (mask > 0).astype(np.uint8)
+    if whole_tumor.sum() == 0:
+        return mask
+
+    labeled, n_labels = ndi.label(whole_tumor)
+    if n_labels <= 1:
+        return mask
+
+    sizes = ndi.sum(whole_tumor, labeled, index=np.arange(1, n_labels + 1))
+    sizes = np.asarray(sizes, dtype=np.float64)
+    keep_label = int(np.argmax(sizes)) + 1
+    keep_region = (labeled == keep_label)
+    return np.where(keep_region, mask, 0).astype(mask.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -167,13 +243,17 @@ def run_inference(
         cfg    = state["cfg"]
         device = state["device"]
 
+    modality_order = _resolve_modality_order(cfg)
+    ordered_paths = {k: paths[k] for k in modality_order}
+
     # Preprocess --------------------------------------------------------
     try:
-        transforms = build_inference_transforms()
-        data = transforms(paths)
+        transforms = build_inference_transforms(modality_order, cfg)
+        data = transforms(ordered_paths)
         image_tensor = data["image"]              # [4, H, W, D]
         meta = getattr(image_tensor, "meta", {})
         affine = meta.get("original_affine", np.eye(4))
+        spacing = _voxel_spacing_from_affine(affine)
     except Exception as e:
         return state, f"❌ Preprocessing failed: {e}"
 
@@ -203,14 +283,18 @@ def run_inference(
         except Exception:
             pass  # GT is optional
 
-    flair_vol = image_tensor[FLAIR_CH].numpy()  # [H, W, D]
+    display_key = "flair" if "flair" in modality_order else modality_order[0]
+    display_ch = modality_order.index(display_key)
+    display_vol = image_tensor[display_ch].numpy()  # [H, W, D]
 
     # Update state ------------------------------------------------------
     state.update({
         "pred_mask": pred_mask,
         "gt_mask":   gt_mask,
-        "flair_vol": flair_vol,
+        "flair_vol": display_vol,
+        "display_channel_name": display_key.upper(),
         "affine":    affine,
+        "spacing":   spacing,
         "depth":     pred_mask.shape[2],
     })
 
@@ -240,6 +324,7 @@ def render_slice(state: dict, slice_idx: int):
     flair_vol = state["flair_vol"]
     pred_mask = state["pred_mask"]
     gt_mask   = state.get("gt_mask")
+    channel_name = state.get("display_channel_name", "FLAIR")
 
     slice_idx = int(np.clip(slice_idx, 0, flair_vol.shape[2] - 1))
     flair_sl  = flair_vol[:, :, slice_idx]
@@ -247,7 +332,7 @@ def render_slice(state: dict, slice_idx: int):
 
     fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5))
     axes[0].imshow(flair_sl.T, cmap="gray", origin="lower")
-    axes[0].set_title(f"FLAIR  (z={slice_idx})", fontsize=10)
+    axes[0].set_title(f"{channel_name}  (z={slice_idx})", fontsize=10)
     axes[0].axis("off")
 
     if gt_mask is not None:
@@ -280,30 +365,32 @@ def render_3d(state: dict) -> go.Figure:
         return go.Figure()
 
     pred_mask = state["pred_mask"]
-    plotly_colors = {
-        1: ("255,60,60",   0.6),
-        2: ("60,210,60",   0.5),
-        3: ("60,60,255",   0.7),
-    }
-    traces = []
-    for cls_id, (rgb, opacity) in plotly_colors.items():
-        binary = (pred_mask == cls_id).astype(np.float32)
-        if binary.sum() < 8:
-            continue
-        try:
-            verts, faces, _, _ = marching_cubes(binary, level=0.5)
-        except ValueError:
-            continue
-        traces.append(go.Mesh3d(
-            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
-            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-            color=f"rgb({rgb})", opacity=opacity,
-            name=CLASS_LABELS[cls_id], showlegend=True,
-        ))
+    vis_mask = _keep_main_tumor_component(pred_mask)
+    spacing = tuple(state.get("spacing", (1.0, 1.0, 1.0)))
+    traces = _build_mesh_traces(
+        vis_mask,
+        spacing,
+        PLOTLY_COLORS,
+        plot_order=PLOTLY_RENDER_ORDER,
+        fallback_mask=pred_mask,
+    )
+
+    # Fallback: if dominant-component view drops too much, render raw mask.
+    if not traces and (pred_mask > 0).any():
+        traces = _build_mesh_traces(
+            pred_mask,
+            spacing,
+            PLOTLY_COLORS,
+            plot_order=PLOTLY_RENDER_ORDER,
+        )
 
     if not traces:
+        total_tumor_voxels = int((pred_mask > 0).sum())
+        text = "No tumor regions detected" if total_tumor_voxels == 0 else (
+            f"Tumor too small/disconnected for stable 3D mesh (voxels={total_tumor_voxels})"
+        )
         fig = go.Figure()
-        fig.add_annotation(text="No tumor regions detected", showarrow=False,
+        fig.add_annotation(text=text, showarrow=False,
                            font=dict(size=16))
         return fig
 
@@ -316,6 +403,61 @@ def render_3d(state: dict) -> go.Figure:
         legend=dict(x=0, y=1),
     )
     return fig
+
+
+def _build_mesh_traces(
+    mask: np.ndarray,
+    spacing: tuple[float, float, float],
+    plotly_colors: dict[int, tuple[str, float]],
+    plot_order: list[int] | None = None,
+    fallback_mask: np.ndarray | None = None,
+) -> list[go.Mesh3d]:
+    traces: list[go.Mesh3d] = []
+    order = plot_order if plot_order is not None else list(plotly_colors.keys())
+    for cls_id in order:
+        if cls_id not in plotly_colors:
+            continue
+        rgb, opacity = plotly_colors[cls_id]
+        binary = (mask == cls_id).astype(np.uint8)
+
+        # If filtered mask removed this class entirely (common for small NCR),
+        # recover this class from the raw prediction mask.
+        if binary.sum() == 0 and fallback_mask is not None:
+            binary = (fallback_mask == cls_id).astype(np.uint8)
+        if binary.sum() == 0:
+            continue
+
+        try:
+            verts, faces, _, _ = marching_cubes(
+                binary.astype(np.float32),
+                level=0.5,
+                spacing=spacing,
+            )
+        except ValueError:
+            if fallback_mask is not None and not np.array_equal(binary, (fallback_mask == cls_id).astype(np.uint8)):
+                binary_fb = (fallback_mask == cls_id).astype(np.uint8)
+                if binary_fb.sum() > 0:
+                    try:
+                        verts, faces, _, _ = marching_cubes(
+                            binary_fb.astype(np.float32),
+                            level=0.5,
+                            spacing=spacing,
+                        )
+                    except ValueError:
+                        continue
+                else:
+                    continue
+            else:
+                continue
+
+        traces.append(go.Mesh3d(
+            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+            color=f"rgb({rgb})", opacity=opacity,
+            name=CLASS_LABELS[cls_id], showlegend=True,
+            flatshading=True,
+        ))
+    return traces
 
 
 # ---------------------------------------------------------------------------

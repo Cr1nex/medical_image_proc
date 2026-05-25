@@ -43,6 +43,7 @@ def build_loss(cfg: dict) -> nn.Module:
             to_onehot_y=True,
             gamma=gamma,
             include_background=False,
+            use_softmax=True,   # MONAI 1.3+ default is False (sigmoid); must be explicit
         )
 
     elif name == "dice_focal":

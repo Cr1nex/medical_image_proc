@@ -10,12 +10,13 @@ Usage:
 import argparse
 import random
 import yaml
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from src.data.preprocessing import build_data_list, split_data
+from src.data.preprocessing import build_data_list_auto, split_data
 from src.data.dataset import build_dataloaders
 from src.models.unet3d import build_model, count_parameters
 from src.models.losses import build_loss
@@ -53,6 +54,12 @@ def main() -> None:
 
     set_seed(cfg.get("seed", 42))
 
+    # Enable TF32 for matmul (off by default in PyTorch; ~20-30% speedup on
+    # Ampere/Ada/Blackwell with negligible precision difference for this task).
+    torch.backends.cuda.matmul.allow_tf32 = True
+    # Let cuDNN auto-select fastest kernels for fixed patch shapes.
+    torch.backends.cudnn.benchmark = True
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
@@ -62,11 +69,13 @@ def main() -> None:
     # Data
     # ------------------------------------------------------------------
     print("\nScanning data directory...")
-    data_list = build_data_list(cfg["data_dir"])
+    data_list = build_data_list_auto(cfg)
     if not data_list:
+        fmt = cfg.get("dataset_format", "brats")
+        src = cfg.get("manifest") if fmt in ("csv", "json") else cfg.get("data_dir")
         raise RuntimeError(
-            f"No BraTS cases found in '{cfg['data_dir']}'. "
-            "Download the BraTS dataset and update data_dir in your config."
+            f"No valid cases found in '{src}' (dataset_format={fmt}). "
+            "Check your data_dir / manifest path and modality_keys."
         )
     print(f"Found {len(data_list)} cases")
 
@@ -123,6 +132,9 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Train
     # ------------------------------------------------------------------
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{cfg['model']}_{cfg['loss']}_{timestamp}"
+
     trainer = Trainer(
         model=model,
         loss_fn=loss_fn,
@@ -130,6 +142,7 @@ def main() -> None:
         val_loader=val_loader,
         cfg=cfg,
         device=device,
+        run_name=run_name,
     )
     trainer.train()
 

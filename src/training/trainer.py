@@ -5,6 +5,7 @@ Logs to TensorBoard (always) and optionally W&B.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import torch
@@ -19,7 +20,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-CLASS_NAMES = ["NCR/NET", "Edema", "Enhancing"]
+CLASS_NAMES = ["NCR/NET", "Edema", "Enhancing Tumor"]
 
 
 class Trainer:
@@ -51,7 +52,10 @@ class Trainer:
             T_max=cfg["max_epochs"],
             eta_min=1e-6,
         )
-        self.scaler = GradScaler("cuda")
+        # BF16 doesn't suffer from the underflow that requires loss scaling,
+        # but GradScaler is a no-op on BF16 — kept for FP16 fallback compatibility.
+        self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        self.scaler = GradScaler("cuda", enabled=(self.amp_dtype == torch.float16))
 
         self.inferer = SlidingWindowInferer(
             roi_size=cfg["patch_size"],
@@ -77,8 +81,8 @@ class Trainer:
         # TensorBoard — always on, logs to outputs/<run_name>/tb_logs/
         tb_dir = self.output_dir / "tb_logs"
         self.writer = SummaryWriter(log_dir=str(tb_dir))
-        print(f"  TensorBoard logs → {tb_dir}")
-        print(f"  Run:  tensorboard --logdir {Path(cfg.get('output_dir', 'outputs'))}")
+        print(f"  TensorBoard logs → {tb_dir}", flush=True)
+        print(f"  Run:  tensorboard --logdir {Path(cfg.get('output_dir', 'outputs'))}", flush=True)
 
         # W&B — optional
         self.use_wandb = cfg.get("use_wandb", False)
@@ -98,11 +102,11 @@ class Trainer:
         max_epochs   = self.cfg["max_epochs"]
         val_interval = self.cfg.get("val_interval", 5)
 
-        print(f"\n{'='*60}")
-        print(f"  Run:   {self.run_name}")
-        print(f"  Model: {self.cfg['model']}  |  Loss: {self.cfg['loss']}")
-        print(f"  LR:    {self.cfg['lr']}  |  Epochs: {max_epochs}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", flush=True)
+        print(f"  Run:   {self.run_name}", flush=True)
+        print(f"  Model: {self.cfg['model']}  |  Loss: {self.cfg['loss']}", flush=True)
+        print(f"  LR:    {self.cfg['lr']}  |  Epochs: {max_epochs}", flush=True)
+        print(f"{'='*60}", flush=True)
 
         # Log hyperparameters to TensorBoard
         self.writer.add_text("config/model",    self.cfg["model"],    0)
@@ -112,7 +116,9 @@ class Trainer:
                              str(self.cfg["patch_size"]), 0)
 
         for epoch in range(1, max_epochs + 1):
+            t0 = time.time()
             train_loss = self._train_epoch(epoch)
+            epoch_secs = time.time() - t0
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
 
@@ -128,12 +134,15 @@ class Trainer:
                     "epoch":            epoch,
                 })
 
+            print(f"  Ep {epoch:03d}/{max_epochs}  loss={train_loss:.4f}  "
+                  f"lr={current_lr:.2e}  time={epoch_secs/60:.1f}min", flush=True)
+
             if epoch % val_interval == 0:
                 val_dsc, per_class = self._validate(epoch)
                 if val_dsc > self.best_val_dsc:
                     self.best_val_dsc = val_dsc
                     self._save_checkpoint("best_model.pth")
-                    print(f"  => New best val DSC: {val_dsc:.4f} — checkpoint saved")
+                    print(f"  => New best val DSC: {val_dsc:.4f} — checkpoint saved", flush=True)
 
         self._save_checkpoint("last_model.pth")
         self.writer.add_hparams(
@@ -147,7 +156,7 @@ class Trainer:
             metric_dict={"hparam/best_val_dsc": self.best_val_dsc},
         )
         self.writer.close()
-        print(f"\nDone. Best val DSC: {self.best_val_dsc:.4f}")
+        print(f"\nDone. Best val DSC: {self.best_val_dsc:.4f}", flush=True)
 
         if self.use_wandb:
             import wandb
@@ -161,43 +170,54 @@ class Trainer:
         self.model.train()
         running_loss = 0.0
         n_steps      = 0
-        log_interval = self.cfg.get("log_interval", 10)
+        log_interval  = self.cfg.get("log_interval", 10)
+        grad_accum    = max(1, self.cfg.get("grad_accum_steps", 1))
 
+        # W&B model watch (once)
+        if self.use_wandb and not self._wandb_watch_done:
+            import wandb
+            wandb.watch(self.model, log="gradients", log_freq=50)
+            self._wandb_watch_done = True
+
+        self.optimizer.zero_grad()
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch:03d}", leave=False, ncols=80)
-        for batch in pbar:
+        for micro_step, batch in enumerate(pbar):
             images = batch["image"].to(self.device)
             labels = batch["label"].to(self.device)
 
-            # W&B model watch (once)
-            if self.use_wandb and not self._wandb_watch_done:
-                import wandb
-                wandb.watch(self.model, log="gradients", log_freq=50)
-                self._wandb_watch_done = True
-
-            self.optimizer.zero_grad()
-            with autocast("cuda"):
+            with autocast("cuda", dtype=self.amp_dtype):
                 preds = self.model(images)
-                loss  = self.loss_fn(preds, labels)
+                # Divide loss so gradients sum to the correct scale after accum
+                loss  = self.loss_fn(preds, labels) / grad_accum
 
             self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
 
-            loss_val = loss.item()
+            is_last_batch    = (micro_step + 1) == len(self.train_loader)
+            do_optimizer_step = ((micro_step + 1) % grad_accum == 0) or is_last_batch
+
+            if do_optimizer_step:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
+                n_steps      += 1
+                self.global_step += 1
+
+            loss_val = loss.item() * grad_accum  # rescale for logging
             running_loss += loss_val
-            n_steps      += 1
-            self.global_step += 1
-            pbar.set_postfix(loss=f"{loss_val:.4f}")
+            mem_gb = torch.cuda.memory_reserved(self.device) / 1e9
+            pbar.set_postfix(loss=f"{loss_val:.4f}", vram=f"{mem_gb:.1f}GB")
 
-            # TensorBoard — step-level loss
-            if n_steps % log_interval == 0:
+            # TensorBoard — step-level loss (log on optimizer steps only)
+            if do_optimizer_step and n_steps % log_interval == 0:
                 self.writer.add_scalar("train/step_loss", loss_val, self.global_step)
 
-            if self.use_wandb and n_steps % log_interval == 0:
+            if self.use_wandb and do_optimizer_step and n_steps % log_interval == 0:
                 import wandb
                 wandb.log({"train/step_loss": loss_val})
 
-        return running_loss / max(n_steps, 1)
+        return running_loss / max(micro_step + 1, 1)
 
     # ------------------------------------------------------------------
     def _validate(self, epoch: int) -> tuple[float, dict]:
@@ -209,7 +229,7 @@ class Trainer:
                 images = batch["image"].to(self.device)
                 labels = batch["label"].to(self.device)
 
-                with autocast("cuda"):
+                with autocast("cuda", dtype=self.amp_dtype):
                     preds = self.inferer(images, self.model)
 
                 preds_post  = [self.post_pred(p)  for p in decollate_batch(preds)]
@@ -222,7 +242,7 @@ class Trainer:
 
         # Console
         parts = "  |  ".join(f"{n}: {v:.4f}" for n, v in per_class.items())
-        print(f"  Ep {epoch:03d} | {parts}  |  Mean: {mean_dsc:.4f}")
+        print(f"  Val  Ep {epoch:03d} | {parts}  |  Mean: {mean_dsc:.4f}", flush=True)
 
         # TensorBoard — val metrics
         self.writer.add_scalar("val/mean_dsc", mean_dsc, epoch)
