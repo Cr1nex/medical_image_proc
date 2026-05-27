@@ -5,8 +5,8 @@ data/
 !src/data/**
 
 # Model checkpoints and training outputs
-outputs/
-
+*.pth
+events.out.tfevents*
 # Python
 __pycache__/
 *.py[cod]

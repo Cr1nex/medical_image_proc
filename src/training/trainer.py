@@ -73,6 +73,11 @@ class Trainer:
         self.post_pred  = Compose([AsDiscrete(argmax=True, to_onehot=out_channels)])
         self.post_label = Compose([AsDiscrete(to_onehot=out_channels)])
 
+        # cuDNN benchmark caches the fastest conv algorithm at startup; that algorithm
+        # requires a fixed workspace size that may become unavailable after many epochs
+        # of memory fragmentation → CUDNN_STATUS_EXECUTION_FAILED_CUDART.
+        torch.backends.cudnn.benchmark = False
+
         self.output_dir = Path(cfg.get("output_dir", "outputs")) / self.run_name
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.best_val_dsc = -1.0
@@ -168,6 +173,7 @@ class Trainer:
     # ------------------------------------------------------------------
     def _train_epoch(self, epoch: int) -> float:
         self.model.train()
+        torch.cuda.empty_cache()
         running_loss = 0.0
         n_steps      = 0
         log_interval  = self.cfg.get("log_interval", 10)
@@ -249,10 +255,7 @@ class Trainer:
         for name, val in per_class.items():
             self.writer.add_scalar(f"val/dsc_{name}", val, epoch)
 
-        # TensorBoard — histogram of model weights (every val step)
-        for tag, param in self.model.named_parameters():
-            if param.grad is not None:
-                self.writer.add_histogram(f"gradients/{tag}", param.grad, epoch)
+        torch.cuda.empty_cache()
 
         if self.use_wandb:
             import wandb

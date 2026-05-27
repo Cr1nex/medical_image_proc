@@ -41,6 +41,7 @@ from skimage.measure import marching_cubes
 
 from src.models.unet3d import build_model
 from src.data.preprocessing import remap_labels
+from src.evaluation.postprocess import remove_small_components
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -272,6 +273,7 @@ def run_inference(
             logits = inferer(image_batch, model)             # [1, 4, H, W, D]
         post = AsDiscrete(argmax=True)
         pred_mask = post(logits[0]).squeeze(0).cpu().numpy().astype(np.int32)
+        pred_mask = remove_small_components(pred_mask)
     except Exception as e:
         return state, f"❌ Inference failed: {e}"
 

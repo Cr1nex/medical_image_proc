@@ -1,22 +1,28 @@
 """
-Quantitative evaluation metrics for brain tumor segmentation.
-  - Dice Similarity Coefficient (DSC) per class
-  - 95th-percentile Hausdorff Distance (HD95) per class
+Quantitative evaluation for brain tumor segmentation.
+
+Per-class (NCR/NET, Edema, Enhancing Tumor):
+  DSC/F1, Precision, Recall, Specificity, Accuracy, IoU, AUROC, HD95
 """
 
 from __future__ import annotations
 
 import numpy as np
 import torch
-from monai.metrics import DiceMetric, HausdorffDistanceMetric
-from monai.transforms import AsDiscrete, Compose
 from monai.data import decollate_batch
-from torch.cuda.amp import autocast
 from monai.inferers import SlidingWindowInferer
+from monai.metrics import HausdorffDistanceMetric
+from monai.transforms import AsDiscrete, Compose
+from sklearn.metrics import roc_auc_score
+from torch.amp import autocast
 
+from src.evaluation.postprocess import remove_small_components
 
-CLASS_NAMES = ["Background", "NCR/NET", "Edema", "Enhancing Tumor"]
-TUMOR_CLASSES = CLASS_NAMES[1:]  # exclude background
+CLASS_NAMES   = ["Background", "NCR/NET", "Edema", "Enhancing Tumor"]
+TUMOR_CLASSES = CLASS_NAMES[1:]
+
+_EPS                    = 1e-8
+_AUROC_VOXELS_PER_BATCH = 50_000   # subsample to keep memory reasonable
 
 
 def evaluate(
@@ -26,30 +32,27 @@ def evaluate(
     device: torch.device,
 ) -> dict[str, dict[str, float]]:
     """
-    Run inference over data_loader and return per-class DSC and HD95.
+    Slide-window inference over data_loader and return a results dict.
 
-    Returns:
+    Return shape::
         {
-            "NCR/NET":         {"dsc": 0.82, "hd95": 4.1},
-            "Edema":           {"dsc": 0.88, "hd95": 3.5},
-            "Enhancing Tumor": {"dsc": 0.79, "hd95": 5.2},
-            "mean":            {"dsc": 0.83, "hd95": 4.3},
+            "NCR/NET":         {"dsc": .., "f1": .., "precision": .., "recall": ..,
+                                "specificity": .., "accuracy": .., "iou": ..,
+                                "auroc": .., "hd95": ..},
+            "Edema":           {...},
+            "Enhancing Tumor": {...},
+            "mean":            {...},
         }
     """
     out_channels = cfg["out_channels"]
+    amp_dtype    = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    dice_metric = DiceMetric(
-        include_background=False,
-        reduction="mean_batch",
-        get_not_nans=True,
-    )
     hd_metric = HausdorffDistanceMetric(
         include_background=False,
         percentile=95,
         reduction="mean_batch",
         get_not_nans=True,
     )
-
     inferer = SlidingWindowInferer(
         roi_size=cfg["patch_size"],
         sw_batch_size=cfg.get("sw_batch_size", 4),
@@ -57,11 +60,20 @@ def evaluate(
         mode="gaussian",
     )
 
-    post_pred = Compose([AsDiscrete(argmax=True, to_onehot=out_channels)])
-    post_label = Compose([AsDiscrete(to_onehot=out_channels)])
+    to_argmax       = AsDiscrete(argmax=True)
+    to_onehot       = AsDiscrete(to_onehot=out_channels)
+    to_onehot_label = Compose([AsDiscrete(to_onehot=out_channels)])
+
+    n_tumor = len(TUMOR_CLASSES)
+    tp = np.zeros(n_tumor)
+    fp = np.zeros(n_tumor)
+    fn = np.zeros(n_tumor)
+    tn = np.zeros(n_tumor)
+
+    auroc_probs  = [[] for _ in range(n_tumor)]
+    auroc_labels = [[] for _ in range(n_tumor)]
 
     model.eval()
-    dice_metric.reset()
     hd_metric.reset()
 
     with torch.no_grad():
@@ -69,40 +81,109 @@ def evaluate(
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
 
-            with autocast():
-                preds = inferer(images, model)
+            with autocast("cuda", dtype=amp_dtype):
+                raw_preds = inferer(images, model)   # [B, C, H, W, D] logits
 
-            preds_list = [post_pred(p) for p in decollate_batch(preds)]
-            labels_list = [post_label(l) for l in decollate_batch(labels)]
+            probs = torch.softmax(raw_preds.float(), dim=1)  # float32 for stability
 
-            dice_metric(y_pred=preds_list, y=labels_list)
+            # argmax → post-process → one-hot
+            argmax_list = [to_argmax(p) for p in decollate_batch(raw_preds)]  # [1,H,W,D]
+            clean_list  = [
+                torch.from_numpy(
+                    remove_small_components(a.squeeze(0).cpu().numpy().astype(np.int32))
+                ).unsqueeze(0).to(device)
+                for a in argmax_list
+            ]
+            preds_list  = [to_onehot(p) for p in clean_list]
+            labels_list = [to_onehot_label(l) for l in decollate_batch(labels)]
+
             hd_metric(y_pred=preds_list, y=labels_list)
 
-    dsc_per_class, _ = dice_metric.aggregate()   # [n_tumor_classes]
+            pred_oh  = torch.stack(preds_list,  dim=0).float()   # [B, C, H, W, D]
+            label_oh = torch.stack(labels_list, dim=0).float()
+
+            for ci, _ in enumerate(TUMOR_CLASSES):
+                c = ci + 1          # channel index (skip background=0)
+                p = pred_oh[:,  c]  # [B, H, W, D]
+                l = label_oh[:, c]
+
+                tp[ci] += (p *       l ).sum().item()
+                fp[ci] += (p * (1 - l)).sum().item()
+                fn[ci] += ((1 - p) * l ).sum().item()
+                tn[ci] += ((1 - p) * (1 - l)).sum().item()
+
+                prob_flat  = probs[:, c].cpu().numpy().ravel()
+                label_flat = l.cpu().numpy().ravel()
+                n_vox      = len(prob_flat)
+                idx = np.random.choice(n_vox,
+                                       min(_AUROC_VOXELS_PER_BATCH, n_vox),
+                                       replace=False)
+                auroc_probs[ci].append(prob_flat[idx])
+                auroc_labels[ci].append(label_flat[idx])
+
     hd_per_class, _ = hd_metric.aggregate()
 
-    results = {}
+    precision   = tp / (tp + fp + _EPS)
+    recall      = tp / (tp + fn + _EPS)
+    f1          = 2 * tp / (2 * tp + fp + fn + _EPS)   # identical to DSC
+    iou         = tp / (tp + fp + fn + _EPS)
+    specificity = tn / (tn + fp + _EPS)
+    accuracy    = (tp + tn) / (tp + tn + fp + fn + _EPS)
+
+    auroc = []
+    for ci in range(n_tumor):
+        all_p = np.concatenate(auroc_probs[ci])
+        all_l = np.concatenate(auroc_labels[ci])
+        try:
+            auroc.append(roc_auc_score(all_l, all_p))
+        except ValueError:
+            auroc.append(float("nan"))
+    auroc = np.array(auroc)
+
+    results: dict[str, dict[str, float]] = {}
     for i, name in enumerate(TUMOR_CLASSES):
         results[name] = {
-            "dsc": dsc_per_class[i].item(),
-            "hd95": hd_per_class[i].item(),
+            "dsc":         f1[i],
+            "f1":          f1[i],
+            "precision":   precision[i],
+            "recall":      recall[i],
+            "specificity": specificity[i],
+            "accuracy":    accuracy[i],
+            "iou":         iou[i],
+            "auroc":       auroc[i],
+            "hd95":        hd_per_class[i].item(),
         }
 
     results["mean"] = {
-        "dsc": dsc_per_class.nanmean().item(),
-        "hd95": hd_per_class.nanmean().item(),
+        "dsc":         float(np.nanmean(f1)),
+        "f1":          float(np.nanmean(f1)),
+        "precision":   float(np.nanmean(precision)),
+        "recall":      float(np.nanmean(recall)),
+        "specificity": float(np.nanmean(specificity)),
+        "accuracy":    float(np.nanmean(accuracy)),
+        "iou":         float(np.nanmean(iou)),
+        "auroc":       float(np.nanmean(auroc)),
+        "hd95":        float(hd_per_class.nanmean().item()),
     }
 
     return results
 
 
 def print_results(results: dict[str, dict[str, float]]) -> None:
-    """Pretty-print evaluation results."""
-    header = f"{'Class':<20} {'DSC':>8} {'HD95 (mm)':>12}"
+    metrics = ["dsc", "precision", "recall", "f1", "specificity", "accuracy", "iou", "auroc", "hd95"]
+    col_w   = 10
+    header  = f"{'Class':<20}" + "".join(f"{m:>{col_w}}" for m in metrics)
     print(header)
     print("-" * len(header))
-    for name, vals in results.items():
-        dsc = vals["dsc"]
-        hd = vals["hd95"]
+    order = TUMOR_CLASSES + ["mean"]
+    for name in order:
+        if name not in results:
+            continue
+        vals   = results[name]
         marker = " *" if name == "mean" else ""
-        print(f"{name:<20} {dsc:>8.4f} {hd:>12.2f}{marker}")
+        row    = f"{name:<20}"
+        for m in metrics:
+            v = vals.get(m, float("nan"))
+            fmt = f"{v:>{col_w}.2f}" if m == "hd95" else f"{v:>{col_w}.4f}"
+            row += fmt
+        print(row + marker)
